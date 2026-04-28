@@ -1,0 +1,10 @@
+{
+  "name": "dcm-ci-basic",
+  "image": "mcr.microsoft.com/devcontainers/base:alpine-3.20",
+  "remoteUser": "vscode",
+  "overrideCommand": true,
+  "containerEnv": {
+    "DCM_CI_FIXTURE": "basic"
+  }
+}
+

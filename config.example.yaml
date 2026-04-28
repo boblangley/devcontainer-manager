@@ -1,0 +1,45 @@
+server:
+  listen: "127.0.0.1:8787"
+
+discovery:
+  includeNamePrefixes:
+    - "vsc-"
+  includeLabels:
+    t3code.enabled: "true"
+
+defaults:
+  containerUser: vscode
+  containerHome: /home/vscode
+
+t3:
+  enabled: true
+  port: 3773
+  autoIssueBackendToken: true
+  serverCommand:
+    - t3
+    - serve
+    - --host
+    - 0.0.0.0
+    - --port
+    - "3773"
+
+sync:
+  enabled: true
+  defaults:
+    ignoreVCS: true
+    ignores:
+      - .DS_Store
+    permissions:
+      defaultFileMode: "0644"
+      defaultDirectoryMode: "0755"
+
+rules:
+  - name: default
+    match: {}
+    t3:
+      enabled: true
+    syncs:
+      - mode: push
+        manager: "/sync/gitconfig"
+        container: "/home/vscode/.gitconfig"
+
