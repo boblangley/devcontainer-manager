@@ -45,10 +45,20 @@ func New(configPath string, cfg config.Config, logger *slog.Logger) (*Service, e
 	if err != nil {
 		return nil, err
 	}
+	var tokenStore t3.BrowserTokenStore
+	if cfg.PairingTokens.PostgresURL != "" {
+		storeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		tokenStore, err = t3.NewPostgresPairingTokenStore(storeCtx, cfg.PairingTokens.PostgresURL)
+		if err != nil {
+			_ = docker.Close()
+			return nil, err
+		}
+	}
 	service := &Service{
 		configPath: configPath,
 		docker:     docker,
-		t3:         t3.New(docker, logger),
+		t3:         t3.NewWithTokenStore(docker, logger, tokenStore),
 		sync:       syncx.New(docker, logger),
 		logger:     logger,
 		containers: map[string]model.Container{},
@@ -58,6 +68,7 @@ func New(configPath string, cfg config.Config, logger *slog.Logger) (*Service, e
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	defer s.t3.Close()
 	defer s.docker.Close()
 	if err := s.reconcile(ctx); err != nil {
 		s.logger.Warn("initial reconcile failed", "error", err)
@@ -274,6 +285,10 @@ func (s *Service) handleEnvProxy(w http.ResponseWriter, r *http.Request) {
 		s.containers[container.ID] = current
 		s.mu.Unlock()
 		return token, nil
+	}
+	if strings.TrimPrefix(rest, envID) == "/spawn-stage" {
+		s.t3.ServeSpawnStage(w, r, container, refresh)
+		return
 	}
 	s.t3.ServeEnv(w, r, env, container.T3, refresh)
 }

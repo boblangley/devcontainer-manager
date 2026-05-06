@@ -7,6 +7,7 @@ require (
 	github.com/docker/docker v26.1.5+incompatible
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/jackc/pgx/v5 v5.9.2
 	github.com/mutagen-io/mutagen v0.18.1
 	google.golang.org/grpc v1.80.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -27,6 +28,9 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hectane/go-acl v0.0.0-20230122075934-ca0b05cb1adb // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.8 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
@@ -45,6 +49,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/term v0.41.0 // indirect
 	golang.org/x/text v0.35.0 // indirect

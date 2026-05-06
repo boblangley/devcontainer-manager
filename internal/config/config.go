@@ -10,12 +10,13 @@ import (
 )
 
 type Config struct {
-	Server    ServerConfig    `yaml:"server" json:"server"`
-	Discovery DiscoveryConfig `yaml:"discovery" json:"discovery"`
-	Defaults  DefaultsConfig  `yaml:"defaults" json:"defaults"`
-	T3        T3Config        `yaml:"t3" json:"t3"`
-	Sync      SyncConfig      `yaml:"sync" json:"sync"`
-	Rules     []Rule          `yaml:"rules" json:"rules"`
+	Server        ServerConfig        `yaml:"server" json:"server"`
+	Discovery     DiscoveryConfig     `yaml:"discovery" json:"discovery"`
+	Defaults      DefaultsConfig      `yaml:"defaults" json:"defaults"`
+	T3            T3Config            `yaml:"t3" json:"t3"`
+	PairingTokens PairingTokensConfig `yaml:"pairingTokens" json:"pairingTokens"`
+	Sync          SyncConfig          `yaml:"sync" json:"sync"`
+	Rules         []Rule              `yaml:"rules" json:"rules"`
 }
 
 type ServerConfig struct {
@@ -26,6 +27,7 @@ type ServerConfig struct {
 type DiscoveryConfig struct {
 	IncludeNamePrefixes []string          `yaml:"includeNamePrefixes" json:"includeNamePrefixes"`
 	IncludeLabels       map[string]string `yaml:"includeLabels" json:"includeLabels"`
+	ConnectToNetwork    string            `yaml:"connectToNetwork" json:"connectToNetwork"`
 }
 
 type DefaultsConfig struct {
@@ -38,6 +40,10 @@ type T3Config struct {
 	Port                  int      `yaml:"port" json:"port"`
 	AutoIssueBackendToken bool     `yaml:"autoIssueBackendToken" json:"autoIssueBackendToken"`
 	ServerCommand         []string `yaml:"serverCommand" json:"serverCommand"`
+}
+
+type PairingTokensConfig struct {
+	PostgresURL string `yaml:"postgresUrl" json:"postgresUrl"`
 }
 
 type SyncConfig struct {

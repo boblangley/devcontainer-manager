@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,12 +26,18 @@ import (
 )
 
 type Gateway struct {
-	docker      *dockerx.Client
+	docker      dockerClient
 	logger      *slog.Logger
 	client      *http.Client
+	tokenStore  BrowserTokenStore
 	mu          sync.Mutex
 	pairing     map[string]pairingCode
 	browserAuth map[string]browserToken
+}
+
+type dockerClient interface {
+	Exec(ctx context.Context, containerID string, cmd []string, args ...string) (string, error)
+	ExecWithStdin(ctx context.Context, containerID string, cmd []string, user string, input []byte) error
 }
 
 type pairingCode struct {
@@ -44,13 +52,51 @@ type browserToken struct {
 	ExpiresAt time.Time
 }
 
+type SpawnStageRequest struct {
+	Agent          string      `json:"agent"`
+	RenderedPrompt string      `json:"renderedPrompt"`
+	WorkspacePath  string      `json:"workspacePath"`
+	Scope          RetainScope `json:"scope"`
+}
+
+type RetainScope struct {
+	BankID string   `json:"bankId"`
+	Tags   []string `json:"tags"`
+}
+
+type t3Project struct {
+	ID                    string          `json:"id"`
+	Title                 string          `json:"title"`
+	WorkspaceRoot         string          `json:"workspaceRoot"`
+	DefaultModelSelection json.RawMessage `json:"defaultModelSelection"`
+}
+
+type orchestrationSnapshot struct {
+	Projects []t3Project `json:"projects"`
+}
+
 func New(docker *dockerx.Client, logger *slog.Logger) *Gateway {
+	return NewWithTokenStore(docker, logger, nil)
+}
+
+func NewWithTokenStore(docker *dockerx.Client, logger *slog.Logger, tokenStore BrowserTokenStore) *Gateway {
+	return newGateway(docker, logger, tokenStore)
+}
+
+func newGateway(docker dockerClient, logger *slog.Logger, tokenStore BrowserTokenStore) *Gateway {
 	return &Gateway{
 		docker:      docker,
 		logger:      logger,
 		client:      &http.Client{Timeout: 3 * time.Second},
+		tokenStore:  tokenStore,
 		pairing:     map[string]pairingCode{},
 		browserAuth: map[string]browserToken{},
+	}
+}
+
+func (g *Gateway) Close() {
+	if closer, ok := g.tokenStore.(interface{ Close() }); ok {
+		closer.Close()
 	}
 }
 
@@ -124,22 +170,81 @@ func (g *Gateway) ServeEnv(w http.ResponseWriter, r *http.Request, env model.Env
 		rest = "/"
 	}
 	if rest == "/api/auth/bootstrap/bearer" && r.Method == http.MethodPost {
-		g.handleBootstrap(w, r, env.ID)
+		g.handleBootstrap(w, r, env)
 		return
 	}
 	if websocket.IsWebSocketUpgrade(r) {
-		if !g.authorized(r, env.ID) {
+		if !g.authorizedWithStore(r, env.ID, firstNonEmpty(env.ContainerID, env.ID)) {
 			http.Error(w, "missing or invalid environment token", http.StatusUnauthorized)
 			return
 		}
 		g.proxyWebsocket(w, r, rest, status, refreshToken)
 		return
 	}
-	if !publicPath(rest) && !g.authorized(r, env.ID) {
+	if !publicPath(rest) && !g.authorizedWithStore(r, env.ID, firstNonEmpty(env.ContainerID, env.ID)) {
 		http.Error(w, "missing or invalid environment token", http.StatusUnauthorized)
 		return
 	}
 	g.proxyHTTP(w, r, rest, status, refreshToken)
+}
+
+func (g *Gateway) ServeSpawnStage(w http.ResponseWriter, r *http.Request, container model.Container, refreshToken func(context.Context) (string, error)) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !g.authorizedWithStore(r, container.T3.EnvironmentID, firstNonEmpty(container.ID, container.T3.EnvironmentID)) {
+		http.Error(w, "missing or invalid environment token", http.StatusUnauthorized)
+		return
+	}
+	var req SpawnStageRequest
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		http.Error(w, "invalid spawn request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := validateSpawnRequest(req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	scope, err := json.Marshal(req.Scope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	scope = append(scope, '\n')
+	target := filepath.Join(req.WorkspacePath, ".hindsight", "active-retain-scope.json")
+	user := firstNonEmpty(container.ContainerUser, "vscode")
+	cmd := []string{"sh", "-c", `mkdir -p "$(dirname "$1")" && cat > "$1.tmp" && mv "$1.tmp" "$1"`, "--", target}
+	if err := g.docker.ExecWithStdin(r.Context(), container.ID, cmd, user, scope); err != nil {
+		http.Error(w, "failed to write retain scope: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	threadID, err := g.openStageThread(r.Context(), container.T3, refreshToken, req)
+	if err != nil {
+		http.Error(w, "failed to open t3 session: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"threadId": threadID})
+}
+
+func validateSpawnRequest(req SpawnStageRequest) error {
+	switch req.Agent {
+	case "codex", "claude", "opencode":
+	default:
+		return errors.New("agent must be codex, claude, or opencode")
+	}
+	if strings.TrimSpace(req.RenderedPrompt) == "" {
+		return errors.New("renderedPrompt is required")
+	}
+	if req.WorkspacePath == "" || !filepath.IsAbs(req.WorkspacePath) {
+		return errors.New("workspacePath must be an absolute container path")
+	}
+	if strings.TrimSpace(req.Scope.BankID) == "" {
+		return errors.New("scope.bankId is required")
+	}
+	return nil
 }
 
 func (g *Gateway) probe(ctx context.Context, backend string) (string, error) {
@@ -178,7 +283,7 @@ func (g *Gateway) issueBackendToken(ctx context.Context, containerID, workspace 
 	return strings.TrimSpace(out), nil
 }
 
-func (g *Gateway) handleBootstrap(w http.ResponseWriter, r *http.Request, envID string) {
+func (g *Gateway) handleBootstrap(w http.ResponseWriter, r *http.Request, env model.Environment) {
 	var payload map[string]string
 	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&payload)
 	code := payload["code"]
@@ -188,14 +293,21 @@ func (g *Gateway) handleBootstrap(w http.ResponseWriter, r *http.Request, envID 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	entry, ok := g.pairing[code]
-	if !ok || entry.EnvID != envID || time.Now().After(entry.ExpiresAt) {
+	if !ok || entry.EnvID != env.ID || time.Now().After(entry.ExpiresAt) {
 		http.Error(w, "invalid pairing code", http.StatusUnauthorized)
 		return
 	}
 	delete(g.pairing, code)
 	token := randomToken(32)
 	expires := time.Now().UTC().Add(24 * time.Hour)
-	g.browserAuth[token] = browserToken{Token: token, EnvID: envID, ExpiresAt: expires}
+	if g.tokenStore != nil {
+		if err := g.tokenStore.Save(r.Context(), firstNonEmpty(env.ContainerID, env.ID), token, expires); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	g.deleteBrowserTokensLocked(env.ID)
+	g.browserAuth[token] = browserToken{Token: token, EnvID: env.ID, ExpiresAt: expires}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"bearerToken": token,
 		"token":       token,
@@ -204,19 +316,54 @@ func (g *Gateway) handleBootstrap(w http.ResponseWriter, r *http.Request, envID 
 	})
 }
 
+func (g *Gateway) Authorized(r *http.Request, envID string) bool {
+	return g.authorized(r, envID)
+}
+
 func (g *Gateway) authorized(r *http.Request, envID string) bool {
+	return g.authorizedWithStore(r, envID, envID)
+}
+
+func (g *Gateway) authorizedWithStore(r *http.Request, envID, storeID string) bool {
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(strings.ToLower(auth), "bearer ") {
 		return false
 	}
 	token := strings.TrimSpace(auth[len("Bearer "):])
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	entry, ok := g.browserAuth[token]
-	if !ok || entry.EnvID != envID || time.Now().After(entry.ExpiresAt) {
+	if ok && entry.EnvID == envID && time.Now().Before(entry.ExpiresAt) {
+		g.mu.Unlock()
+		return true
+	}
+	g.mu.Unlock()
+	if g.tokenStore == nil {
 		return false
 	}
+	entry, ok, err := g.tokenStore.Get(r.Context(), storeID)
+	if err != nil {
+		g.logger.Warn("failed to load pairing token", "environment", envID, "error", err)
+		return false
+	}
+	if !ok || entry.Token != token || time.Now().After(entry.ExpiresAt) {
+		if ok && time.Now().After(entry.ExpiresAt) {
+			_ = g.tokenStore.Delete(r.Context(), storeID)
+		}
+		return false
+	}
+	entry.EnvID = envID
+	g.mu.Lock()
+	g.browserAuth[token] = entry
+	g.mu.Unlock()
 	return true
+}
+
+func (g *Gateway) deleteBrowserTokensLocked(envID string) {
+	for token, entry := range g.browserAuth {
+		if entry.EnvID == envID {
+			delete(g.browserAuth, token)
+		}
+	}
 }
 
 func (g *Gateway) proxyHTTP(w http.ResponseWriter, r *http.Request, rest string, status model.T3Status, refreshToken func(context.Context) (string, error)) {
@@ -261,6 +408,125 @@ func (g *Gateway) proxyHTTP(w http.ResponseWriter, r *http.Request, rest string,
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (g *Gateway) openStageThread(ctx context.Context, status model.T3Status, refreshToken func(context.Context) (string, error), req SpawnStageRequest) (string, error) {
+	var snapshot orchestrationSnapshot
+	if err := g.backendJSON(ctx, &status, refreshToken, http.MethodGet, "/api/orchestration/snapshot", nil, &snapshot); err != nil {
+		return "", err
+	}
+	modelSelection := modelSelectionFor(req.Agent, nil)
+	project, ok := projectForWorkspace(snapshot.Projects, req.WorkspacePath)
+	if ok && len(project.DefaultModelSelection) > 0 && string(project.DefaultModelSelection) != "null" {
+		modelSelection = modelSelectionFor(req.Agent, project.DefaultModelSelection)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if !ok {
+		project = t3Project{
+			ID:            "dcm-project-" + randomToken(12),
+			Title:         projectTitle(req.WorkspacePath),
+			WorkspaceRoot: req.WorkspacePath,
+		}
+		if err := g.dispatch(ctx, &status, refreshToken, map[string]any{
+			"type":                  "project.create",
+			"commandId":             "dcm-command-" + randomToken(12),
+			"projectId":             project.ID,
+			"title":                 project.Title,
+			"workspaceRoot":         project.WorkspaceRoot,
+			"defaultModelSelection": modelSelection,
+			"createdAt":             now,
+		}); err != nil {
+			return "", err
+		}
+	}
+	threadID := "dcm-thread-" + randomToken(12)
+	title := threadTitle(req.RenderedPrompt)
+	if err := g.dispatch(ctx, &status, refreshToken, map[string]any{
+		"type":            "thread.create",
+		"commandId":       "dcm-command-" + randomToken(12),
+		"threadId":        threadID,
+		"projectId":       project.ID,
+		"title":           title,
+		"modelSelection":  modelSelection,
+		"runtimeMode":     "full-access",
+		"interactionMode": "default",
+		"branch":          nil,
+		"worktreePath":    nil,
+		"createdAt":       now,
+	}); err != nil {
+		return "", err
+	}
+	if err := g.dispatch(ctx, &status, refreshToken, map[string]any{
+		"type":      "thread.turn.start",
+		"commandId": "dcm-command-" + randomToken(12),
+		"threadId":  threadID,
+		"message": map[string]any{
+			"messageId":   "dcm-message-" + randomToken(12),
+			"role":        "user",
+			"text":        req.RenderedPrompt,
+			"attachments": []any{},
+		},
+		"modelSelection":  modelSelection,
+		"titleSeed":       title,
+		"runtimeMode":     "full-access",
+		"interactionMode": "default",
+		"createdAt":       now,
+	}); err != nil {
+		return "", err
+	}
+	return threadID, nil
+}
+
+func (g *Gateway) dispatch(ctx context.Context, status *model.T3Status, refreshToken func(context.Context) (string, error), command map[string]any) error {
+	var result map[string]any
+	return g.backendJSON(ctx, status, refreshToken, http.MethodPost, "/api/orchestration/dispatch", command, &result)
+}
+
+func (g *Gateway) backendJSON(ctx context.Context, status *model.T3Status, refreshToken func(context.Context) (string, error), method, rest string, input, output any) error {
+	do := func(token string) (*http.Response, error) {
+		target := strings.TrimRight(status.BackendURL, "/") + rest
+		var body io.Reader
+		if input != nil {
+			buf, err := json.Marshal(input)
+			if err != nil {
+				return nil, err
+			}
+			body = bytes.NewReader(buf)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, target, body)
+		if err != nil {
+			return nil, err
+		}
+		if input != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		return g.client.Do(req)
+	}
+	resp, err := do(status.BackendToken)
+	if err == nil && resp.StatusCode == http.StatusUnauthorized && refreshToken != nil {
+		_ = resp.Body.Close()
+		token, refreshErr := refreshToken(ctx)
+		if refreshErr == nil {
+			status.BackendToken = token
+			resp, err = do(token)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	if output == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(output)
 }
 
 func (g *Gateway) proxyWebsocket(w http.ResponseWriter, r *http.Request, rest string, status model.T3Status, refreshToken func(context.Context) (string, error)) {
@@ -357,6 +623,79 @@ func copyHeader(dst, src http.Header) {
 
 func singleJoiningSlash(a, b string) string {
 	return path.Join("/", strings.TrimPrefix(a, "/"), strings.TrimPrefix(b, "/"))
+}
+
+func projectForWorkspace(projects []t3Project, workspace string) (t3Project, bool) {
+	clean := filepath.Clean(workspace)
+	for _, project := range projects {
+		if filepath.Clean(project.WorkspaceRoot) == clean {
+			return project, true
+		}
+	}
+	return t3Project{}, false
+}
+
+func modelSelectionFor(agent string, existing json.RawMessage) map[string]any {
+	instanceID := providerInstanceID(agent)
+	if len(existing) > 0 {
+		var selection map[string]any
+		if err := json.Unmarshal(existing, &selection); err == nil {
+			if selection["instanceId"] == instanceID {
+				return selection
+			}
+		}
+	}
+	return map[string]any{
+		"instanceId": instanceID,
+		"model":      defaultModel(agent),
+	}
+}
+
+func providerInstanceID(agent string) string {
+	if agent == "claude" {
+		return "claudeAgent"
+	}
+	return agent
+}
+
+func defaultModel(agent string) string {
+	switch agent {
+	case "claude":
+		return "claude-sonnet-4-6"
+	case "opencode":
+		return "openai/gpt-5"
+	default:
+		return "gpt-5.4"
+	}
+}
+
+func projectTitle(workspace string) string {
+	base := filepath.Base(filepath.Clean(workspace))
+	if base == "." || base == string(filepath.Separator) || base == "" {
+		return "Workspace"
+	}
+	return base
+}
+
+func threadTitle(prompt string) string {
+	title := strings.TrimSpace(strings.Split(strings.ReplaceAll(prompt, "\r\n", "\n"), "\n")[0])
+	if title == "" {
+		return "Spawned stage"
+	}
+	const max = 80
+	if len(title) > max {
+		title = strings.TrimSpace(title[:max])
+	}
+	return title
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func randomCode(n int) string {

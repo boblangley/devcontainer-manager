@@ -6,6 +6,9 @@ discovery:
     - "vsc-"
   includeLabels:
     t3code.enabled: "true"
+  # Optional. When set, DCM attaches each running detected devcontainer to this
+  # existing Docker network and prefers that network IP for container access.
+  connectToNetwork: ""
 
 defaults:
   containerUser: vscode
@@ -22,6 +25,12 @@ t3:
     - 0.0.0.0
     - --port
     - "3773"
+
+pairingTokens:
+  # Optional. When set, DCM persists browser bearer tokens issued by the
+  # pairing dance so paired dashboard/API clients survive DCM restarts.
+  postgresUrl: ""
+  # postgresUrl: "postgres://devcontainer_manager:devcontainer_manager@localhost:5432/devcontainer_manager?sslmode=disable"
 
 sync:
   enabled: true
@@ -42,4 +51,3 @@ rules:
       - mode: push
         manager: "/sync/gitconfig"
         container: "/home/vscode/.gitconfig"
-
