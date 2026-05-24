@@ -1,5 +1,5 @@
 {
-  "name": "Devcontainer Manager Devcontainer",
+  "name": "Devcontainer Manager",
   "image": "mcr.microsoft.com/devcontainers/base:noble",
   "features": {
     "ghcr.io/devcontainers/features/go:1": {},
@@ -37,12 +37,8 @@
       }
     }
   },
-
-  "remoteEnv": {
-    "PATH": "${containerEnv:PATH}:/usr/local/go/bin:/go/bin"
-  },
-
-  "postCreateCommand": {
-    "golangci-lint": "go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"
+  "containerEnv": {
+    "DEVCONTAINER_ID": "${devcontainerId}",
+    "WORKSPACE_HOME": "${containerWorkspaceFolder}"
   }
 }
